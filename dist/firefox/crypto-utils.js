@@ -1,6 +1,8 @@
-// crypto-utils.js — WebCrypto AES-GCM + PBKDF2 helper
+// crypto-utils.js
 
-async function deriveKey(passphrase, salt) {
+const CURRENT_ITERATIONS = 600000;
+
+async function getDerivedKey(passphrase, salt, iterations) {
     const enc = new TextEncoder();
     const keyMaterial = await crypto.subtle.importKey(
         "raw",
@@ -13,7 +15,7 @@ async function deriveKey(passphrase, salt) {
         {
             name: "PBKDF2",
             salt: salt,
-            iterations: 100000,
+            iterations: iterations,
             hash: "SHA-256",
         },
         keyMaterial,
@@ -23,38 +25,42 @@ async function deriveKey(passphrase, salt) {
     );
 }
 
-async function encryptData(dataObj, passphrase) {
+async function encryptData(data, passphrase) {
     const enc = new TextEncoder();
     const salt = crypto.getRandomValues(new Uint8Array(16));
     const iv = crypto.getRandomValues(new Uint8Array(12));
-    const key = await deriveKey(passphrase, salt);
+    const key = await getDerivedKey(passphrase, salt, CURRENT_ITERATIONS);
 
-    const plaintext = enc.encode(JSON.stringify(dataObj));
-    const ciphertext = await crypto.subtle.encrypt(
+    const encrypted = await crypto.subtle.encrypt(
         { name: "AES-GCM", iv: iv },
         key,
-        plaintext
+        enc.encode(JSON.stringify(data))
     );
 
     return {
-        ciphertext: Array.from(new Uint8Array(ciphertext)),
         salt: Array.from(salt),
         iv: Array.from(iv),
+        data: Array.from(new Uint8Array(encrypted)),
+        iterations: CURRENT_ITERATIONS
     };
 }
 
-async function decryptData(encryptedObj, passphrase) {
-    const dec = new TextDecoder();
-    const salt = new Uint8Array(encryptedObj.salt);
-    const iv = new Uint8Array(encryptedObj.iv);
-    const ciphertext = new Uint8Array(encryptedObj.ciphertext);
-    const key = await deriveKey(passphrase, salt);
+async function decryptData(payload, passphrase) {
+    // Fallback to 100,000 for older saved sessions that didn't record their iteration count
+    const iterations = payload.iterations || 100000;
+
+    const salt = new Uint8Array(payload.salt);
+    const iv = new Uint8Array(payload.iv);
+    const encrypted = new Uint8Array(payload.data);
+
+    const key = await getDerivedKey(passphrase, salt, iterations);
 
     const decrypted = await crypto.subtle.decrypt(
         { name: "AES-GCM", iv: iv },
         key,
-        ciphertext
+        encrypted
     );
 
+    const dec = new TextDecoder();
     return JSON.parse(dec.decode(decrypted));
 }

@@ -1,21 +1,18 @@
 // background.js — MV3 service worker
+
 // Firefox (109+) and Chrome both support service_worker for MV3 background.
-// background.js — MV3 service worker (Chrome) / background script (Firefox)
-//
-// On Chrome this runs as a real service worker, so we pull in the compat
-// shim via importScripts(). On Firefox (background.scripts mode), the
-// manifest already loads browser-compat.js first, and importScripts()
-// doesn't exist in that context — so we only call it if it's available.
 if (typeof importScripts === "function") {
   importScripts("browser-compat.js");
 }
 
-ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
+const api = typeof browser !== "undefined" ? browser : chrome;
+
+api.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "SWITCH_ACCOUNT") {
     handleSwitchAccount(message)
       .then((result) => sendResponse(result))
       .catch((err) => sendResponse({ ok: false, error: err.message }));
-    return true; // keep the message channel open for the async response
+    return true;
   }
   if (message?.type === "CLEAR_COOKIES") {
     handleClearCookies(message)
@@ -25,56 +22,67 @@ ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 });
 
-async function handleSwitchAccount({ tabUrl, tabId, cookies }) {
-  // 1. Remove every cookie currently visible to this page.
-  const existing = await ext.cookies.getAll({ url: tabUrl });
-  for (const cookie of existing) {
-    try {
-      await ext.cookies.remove({
-        url: cookieUrl(cookie),
-        name: cookie.name,
-        storeId: cookie.storeId,
-      });
-    } catch (err) {
-      // Non-fatal: keep going even if one cookie can't be removed.
-      console.warn("Failed to remove cookie", cookie.name, err);
+async function handleSwitchAccount({ domain, tabUrl, tabId, cookies }) {
+  let backupCookies = [];
+  try {
+    // 1. Capture current cookies for rollback in case of partial failure
+    backupCookies = await api.cookies.getAll({ url: tabUrl });
+
+    // 2. Remove every cookie currently visible to this page.
+    await clearCookiesForUrl(tabUrl);
+    await clearPageStorage(tabId);
+
+    // 3. Re-create every cookie from the saved account with strict validation.
+    const failures = [];
+    for (const cookie of cookies) {
+      // Validate that the injected cookie actually belongs to the active domain
+      if (!cookie.domain.endsWith(domain) && !domain.endsWith(cookie.domain)) {
+        console.warn(`[SessionSwitcher] Rejected mismatched cookie domain: ${cookie.domain}`);
+        continue;
+      }
+
+      try {
+        await api.cookies.set(buildSetDetails(cookie));
+      } catch (err) {
+        failures.push(`${cookie.name}: ${err.message}`);
+      }
     }
-  }
 
-  // 2. Re-create every cookie from the saved account.
-  const failures = [];
-  for (const cookie of cookies) {
-    try {
-      await ext.cookies.set(buildSetDetails(cookie));
-    } catch (err) {
-      failures.push(`${cookie.name}: ${err.message}`);
+    // 4. Reload the tab so the site picks up the new session.
+    if (typeof tabId === "number") {
+      await api.tabs.reload(tabId);
     }
-  }
 
-  // 3. Reload the tab so the site picks up the new session.
-  if (typeof tabId === "number") {
-    await ext.tabs.reload(tabId);
-  }
+    if (failures.length > 0) {
+      return {
+        ok: true,
+        warning: `Some cookies could not be restored: ${failures.join("; ")}`,
+      };
+    }
+    return { ok: true };
 
-  if (failures.length > 0) {
-    return {
-      ok: true,
-      warning: `Some cookies could not be restored: ${failures.join("; ")}`,
-    };
+  } catch (error) {
+    // Failsafe Rollback: Restore backup cookies if the core injection crashed
+    if (backupCookies.length > 0) {
+      console.log("[SessionSwitcher] Switch failed, attempting rollback...");
+      await clearCookiesForUrl(tabUrl);
+      for (const bc of backupCookies) {
+        try {
+          await api.cookies.set(buildSetDetails(bc));
+        } catch (e) { /* ignore rollback errors */ }
+      }
+    }
+    return { ok: false, error: error.message };
   }
-  return { ok: true };
 }
 
-// NEW: manually clear cookies (and optionally localStorage/sessionStorage/
-// IndexedDB) for the active tab's domain — useful for sites like Coda that
-// cache auth state client-side, where clearing cookies alone isn't enough
-// to force a real logout before switching accounts.
 async function handleClearCookies({ tabUrl, tabId, alsoClearStorage }) {
-  const existing = await ext.cookies.getAll({ url: tabUrl });
+  const existing = await api.cookies.getAll({ url: tabUrl });
   const cookieFailures = [];
+
   for (const cookie of existing) {
     try {
-      await ext.cookies.remove({
+      await api.cookies.remove({
         url: cookieUrl(cookie),
         name: cookie.name,
         storeId: cookie.storeId,
@@ -87,17 +95,14 @@ async function handleClearCookies({ tabUrl, tabId, alsoClearStorage }) {
   let storageWarning = null;
   if (alsoClearStorage && typeof tabId === "number") {
     try {
-      await ext.scripting.executeScript({
-        target: { tabId },
-        func: clearPageStorage,
-      });
+      await clearPageStorage(tabId);
     } catch (err) {
       storageWarning = `Could not clear page storage: ${err.message}`;
     }
   }
 
   if (typeof tabId === "number") {
-    await ext.tabs.reload(tabId);
+    await api.tabs.reload(tabId);
   }
 
   if (cookieFailures.length > 0 || storageWarning) {
@@ -111,30 +116,42 @@ async function handleClearCookies({ tabUrl, tabId, alsoClearStorage }) {
   return { ok: true };
 }
 
-// This function is injected into the page itself via chrome.scripting,
-// so it runs in the page's context, not the extension's.
-function clearPageStorage() {
-  try {
-    localStorage.clear();
-  } catch (e) {
-    /* ignore — some pages restrict storage access */
-  }
-  try {
-    sessionStorage.clear();
-  } catch (e) {
-    /* ignore */
-  }
-  try {
-    if (indexedDB.databases) {
-      indexedDB.databases().then((dbs) => {
-        dbs.forEach((db) => {
-          if (db.name) indexedDB.deleteDatabase(db.name);
-        });
-      });
+// Clears cookies specifically using the constructed URL
+async function clearCookiesForUrl(url) {
+  const currentCookies = await api.cookies.getAll({ url });
+  const clearPromises = currentCookies.map((c) =>
+    api.cookies.remove({
+      url: cookieUrl(c),
+      name: c.name,
+      storeId: c.storeId,
+    })
+  );
+  await Promise.all(clearPromises);
+}
+
+// Injects the cleanup script into the page context
+async function clearPageStorage(tabId) {
+  await api.scripting.executeScript({
+    target: { tabId: tabId },
+    func: async () => {
+      try { localStorage.clear(); } catch (e) { }
+      try { sessionStorage.clear(); } catch (e) { }
+
+      try {
+        if (indexedDB.databases) {
+          const dbs = await indexedDB.databases();
+          const deletePromises = dbs.map(db => new Promise((resolve, reject) => {
+            if (!db.name) return resolve();
+            const req = indexedDB.deleteDatabase(db.name);
+            req.onsuccess = () => resolve();
+            req.onerror = () => reject();
+            req.onblocked = () => resolve();
+          }));
+          await Promise.all(deletePromises);
+        }
+      } catch (e) { }
     }
-  } catch (e) {
-    /* ignore — indexedDB.databases() isn't supported everywhere */
-  }
+  });
 }
 
 // Builds the URL chrome.cookies.remove/set needs to identify a cookie.
@@ -143,6 +160,7 @@ function cookieUrl(cookie) {
   return `${cookie.secure ? "https" : "http"}://${host}${cookie.path}`;
 }
 
+// Accurately formats the cookie object for the browser API
 function buildSetDetails(cookie) {
   const details = {
     url: cookieUrl(cookie),
@@ -153,19 +171,15 @@ function buildSetDetails(cookie) {
     httpOnly: cookie.httpOnly,
   };
 
-  // Only set `domain` for domain-cookies (leading dot). Host-only cookies
-  // should be left without a domain so the browser derives it from `url`.
   if (!cookie.hostOnly && cookie.domain) {
     details.domain = cookie.domain;
   }
 
-  // Normalize sameSite across browsers; fall back to a safe default.
   const validSameSite = ["no_restriction", "lax", "strict"];
   if (validSameSite.includes(cookie.sameSite)) {
     details.sameSite = cookie.sameSite;
   }
 
-  // Omit expirationDate entirely for session cookies.
   if (typeof cookie.expirationDate === "number") {
     details.expirationDate = cookie.expirationDate;
   }
